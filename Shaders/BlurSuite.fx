@@ -4,8 +4,8 @@
 
     BlurSuite
 
-   Version: 1.0
-   Author: Barbados
+   Version: 1.1
+   Author: Barbatos
 
    About: A collection of blur effects for ReShade.
  */
@@ -14,10 +14,14 @@
 #include "Blending.fxh"
 
 #define GetColor(coord) tex2Dlod(ReShade::BackBuffer, float4(coord, 0.0, 0.0))
+#define GetDepth(coord) ReShade::GetLinearizedDepth(coord).r
+static const float2 LOD_MASK = float2(0.0, 1.0);
+static const float2 ZERO_LOD = float2(0.0, 0.0);
+#define GetLod(s,c) tex2Dlod(s, ((c).xyyy * LOD_MASK.yyxx + ZERO_LOD.xxxy))
 
-/*-------------------.
-| :: Parameters ::   |
-'-------------------*/
+/*----------.
+| :: UI::   |
+'----------*/
 
 BLENDING_COMBO(BlurBlendMode, "Blend Mode", "Selects the blending mode for combining the blur with the original image.", "Master Controls", false, 1, 0)
 
@@ -30,10 +34,25 @@ uniform float BlurMix <
     ui_max = 1.0;
 > = 1.0;
 
-//Box Blur 
+uniform bool EnableDepthCheck <
+    ui_category = "Depth Controls";
+    ui_type = "checkbox";
+    ui_label = "Enable Depth Check";
+    ui_tooltip = "Prevents blur from bleeding between foreground and background objects.";
+> = false;
+
+uniform float DepthThreshold <
+    ui_category = "Depth Controls";
+    ui_type = "slider";
+    ui_label = "Depth Threshold";
+    ui_tooltip = "Determines how much difference in depth is allowed for blurring. Lower values are stricter.";
+    ui_min = 0.0;
+    ui_max = 0.1;
+    ui_step = 0.001;
+> = 0.01;
+
 uniform bool EnableBoxBlur <
     ui_category = "Box Blur";
-    ui_type = "checkbox";
     ui_label = "Enable Box Blur";
     ui_tooltip = "A simple and fast blur effect. Good for performance.";
 > = false;
@@ -57,10 +76,8 @@ uniform int BoxBlurSamples <
     ui_max = 32;
 > = 16;
 
-// Gaussian Blur
 uniform bool EnableGaussianBlur <
     ui_category = "Gaussian Blur";
-    ui_type = "checkbox";
     ui_label = "Enable Gaussian Blur";
 > = false;
 
@@ -83,10 +100,8 @@ uniform int GaussianBlurSamples <
     ui_max = 32;
 > = 16;
 
-//Zoom Blur
 uniform bool EnableZoomBlur <
     ui_category = "Zoom Blur";
-    ui_type = "checkbox";
     ui_label = "Enable Zoom Blur";
 > = false;
 
@@ -117,10 +132,8 @@ uniform int ZoomBlurSamples <
     ui_max = 32;
 > = 16;
 
-// Fake Motion Blur
 uniform bool EnableMotionBlur <
     ui_category = "Fake Motion Blur";
-    ui_type = "checkbox";
     ui_label = "Enable Fake Motion Blur";
 > = false;
 
@@ -152,10 +165,8 @@ uniform int MotionBlurSamples <
     ui_max = 32;
 > = 16;
 
-//Rotation Blur
 uniform bool EnableRotationBlur <
     ui_category = "Rotation Blur";
-    ui_type = "checkbox";
     ui_label = "Enable Rotation Blur";
 > = false;
 
@@ -215,23 +226,35 @@ sampler BlurTempSampler
 | :: Functions :: |
 '----------------*/
 
+float Gaussian(float x, float sigma)
+{
+    return exp(-0.5 * (x * x) / (sigma * sigma));
+}
+
 float3 ApplyBoxBlur1D(sampler source, float2 uv, float2 direction, float radius, int samples)
 {
     float3 color = 0.0;
     float step = radius / (samples / 2.0);
+    float center_depth = EnableDepthCheck ? GetDepth(uv) : 0.0;
+    int valid_samples = 0;
 
     for (int i = -samples / 2; i <= samples / 2; i++)
     {
         float2 offset = direction * i * ReShade::PixelSize * step;
-        color += tex2D(source, uv + offset).rgb;
+        float2 sample_uv = uv + offset;
+
+        if (EnableDepthCheck)
+        {
+            float sample_depth = GetDepth(sample_uv);
+            if (abs(center_depth - sample_depth) > DepthThreshold)
+                continue;
+        }
+
+        color += GetLod(source, sample_uv).rgb;
+        valid_samples++;
     }
 
-    return color / (samples + 1);
-}
-
-float Gaussian(float x, float sigma)
-{
-    return exp(-0.5 * (x * x) / (sigma * sigma));
+    return (valid_samples > 0) ? color / valid_samples : GetLod(source, uv).rgb;
 }
 
 float3 ApplyGaussianBlur1D(sampler source, float2 uv, float2 direction, float radius, int samples)
@@ -239,30 +262,52 @@ float3 ApplyGaussianBlur1D(sampler source, float2 uv, float2 direction, float ra
     float3 color = 0.0;
     float total_weight = 0.0;
     float sigma = samples / 2.0;
+    float center_depth = EnableDepthCheck ? GetDepth(uv) : 0.0;
 
     for (int i = -samples / 2; i <= samples / 2; i++)
     {
-        float weight = Gaussian(i, sigma);
         float2 offset = direction * i * ReShade::PixelSize * radius;
-        color += tex2D(source, uv + offset).rgb * weight;
+        float2 sample_uv = uv + offset;
+        
+        if (EnableDepthCheck)
+        {
+            float sample_depth = GetDepth(sample_uv);
+            if (abs(center_depth - sample_depth) > DepthThreshold)
+                continue;
+        }
+
+        float weight = Gaussian(i, sigma);
+        color += GetLod(source, sample_uv).rgb * weight;
         total_weight += weight;
     }
 
-    return color / total_weight;
+    return (total_weight > 0.0) ? color / total_weight : GetLod(source, uv).rgb;
 }
 
 float3 ApplyZoomBlur(float2 uv, float2 center, float radius, int samples)
 {
     float3 blurred_color = 0.0;
     float2 dir = uv - center;
+    float center_depth = EnableDepthCheck ? GetDepth(uv) : 0.0;
+    int valid_samples = 0;
 
     for (int i = 0; i < samples; i++)
     {
         float percent = (float) i / (samples - 1);
-        blurred_color += GetColor(uv - dir * percent * radius).rgb;
+        float2 sample_uv = uv - dir * percent * radius;
+
+        if (EnableDepthCheck)
+        {
+            float sample_depth = GetDepth(sample_uv);
+            if (abs(center_depth - sample_depth) > DepthThreshold)
+                continue;
+        }
+        
+        blurred_color += GetColor(sample_uv).rgb;
+        valid_samples++;
     }
 
-    return blurred_color / samples;
+    return (valid_samples > 0) ? blurred_color / valid_samples : GetColor(uv).rgb;
 }
 
 float3 ApplyMotionBlur(float2 uv, float radius, float angle, int samples)
@@ -270,15 +315,27 @@ float3 ApplyMotionBlur(float2 uv, float radius, float angle, int samples)
     float3 blurred_color = 0.0;
     float rad_angle = radians(angle);
     float2 direction = float2(cos(rad_angle), sin(rad_angle));
+    float center_depth = EnableDepthCheck ? GetDepth(uv) : 0.0;
+    int valid_samples = 0;
 
     for (int i = 0; i < samples; i++)
     {
         float percent = (float) i / (samples - 1);
         float2 offset = direction * lerp(0.0, -radius, percent);
-        blurred_color += GetColor(uv + offset).rgb;
+        float2 sample_uv = uv + offset;
+
+        if (EnableDepthCheck)
+        {
+            float sample_depth = GetDepth(sample_uv);
+            if (abs(center_depth - sample_depth) > DepthThreshold)
+                continue;
+        }
+
+        blurred_color += GetColor(sample_uv).rgb;
+        valid_samples++;
     }
     
-    return blurred_color / samples;
+    return (valid_samples > 0) ? blurred_color / valid_samples : GetColor(uv).rgb;
 }
 
 float3 ApplyRotationBlur(float2 uv, float2 center, float angle, float strength, int samples)
@@ -286,6 +343,8 @@ float3 ApplyRotationBlur(float2 uv, float2 center, float angle, float strength, 
     float3 blurred_color = 0.0;
     float2 dir = uv - center;
     float total_angle = radians(angle) * strength;
+    float center_depth = EnableDepthCheck ? GetDepth(uv) : 0.0;
+    int valid_samples = 0;
 
     for (int i = 0; i < samples; i++)
     {
@@ -300,10 +359,20 @@ float3 ApplyRotationBlur(float2 uv, float2 center, float angle, float strength, 
             dir.x * s + dir.y * c
         );
         
-        blurred_color += GetColor(center + rotated_dir).rgb;
+        float2 sample_uv = center + rotated_dir;
+
+        if (EnableDepthCheck)
+        {
+            float sample_depth = GetDepth(sample_uv);
+            if (abs(center_depth - sample_depth) > DepthThreshold)
+                continue;
+        }
+
+        blurred_color += GetColor(sample_uv).rgb;
+        valid_samples++;
     }
 
-    return blurred_color / samples;
+    return (valid_samples > 0) ? blurred_color / valid_samples : GetColor(uv).rgb;
 }
 
 
@@ -376,10 +445,6 @@ float4 FinalPass(float4 pos : SV_Position, float2 uv : TexCoord) : SV_Target
 
     return float4(saturate(final_color), 1.0);
 }
-
-/*------------------.
-| :: Technique ::   |
-'------------------*/
 
 technique BlurSuite
 {
